@@ -1,18 +1,18 @@
 {
   "packageName": "iStore Heat Pump",
   "author": "Jamie Curnow",
-  "version": "0.0.1",
+  "version": "1.0.0",
   "minimumHEVersion": "2.3.0",
   "dateReleased": "2026-10-06",
   "documentationLink": "https://github.com/jc21/hubitat-istore-heat-pump",
   "communityLink": "",
-  "releaseNotes": "Initial release",
+  "releaseNotes": "Stable release",
   "apps": [
     {
       "id": "6f4b8f0e-7a52-4a0e-9f3c-2d1f6a8e4b11",
       "name": "iStore Heat Pump Connect",
       "namespace": "jc21",
-      "location": "https://raw.githubusercontent.com/jc21/hubitat-istore-heat-pump/main/apps/istore-heat-pump-app.groovy",
+      "location": "https://raw.githubusercontent.com/jc21/hubitat-istore-heat-pump/refs/tags/v1.0.0/istore-heat-pump-app.groovy",
       "required": true,
       "primary": true,
       "oauth": false
@@ -23,7 +23,7 @@
       "id": "b3d1c6a2-58e4-4f7d-a1c9-7e2f0b9d4c33",
       "name": "iStore Heat Pump",
       "namespace": "jc21",
-      "location": "https://raw.githubusercontent.com/jc21/hubitat-istore-heat-pump/main/drivers/istore-heat-pump.groovy",
+      "location": "https://raw.githubusercontent.com/jc21/hubitat-istore-heat-pump/refs/tags/v1.0.0/istore-heat-pump.groovy",
       "required": true
     }
   ]

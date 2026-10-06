@@ -22,7 +22,6 @@ import groovy.transform.Field
 @Field static final String PATH_LOGIN = "/hossain-bff/framework/v1.0/user/login"
 @Field static final String PATH_SET_SESSION = "/hossain-bff/framework/v1.0/user/set-session"
 @Field static final String PATH_REFRESH = "/hossain-bff/framework/v1.0/user/refresh-token"
-@Field static final String PATH_SITE_LIST = "/hossain-bff/site/v1.0/list"
 @Field static final String PATH_ASSET_LIST = "/hossain-bff/monitor/v1.0/asset/list"
 @Field static final String PATH_HIERARCHY = "/encompassbffservice/encompass-bff/asset-service/v1.0/asset-hierarchy"
 @Field static final String PATH_ATTRIBUTES = "/encompassbffservice/encompass-bff/anti-timeseries/v1.0/attributes"
@@ -31,6 +30,7 @@ import groovy.transform.Field
 @Field static final String PATH_ASSET_UPDATE = "/hossain-bff/monitor/v1.0/asset/update"
 
 @Field static final String WATER_HEATER_TYPE = "Res_WaterHeater"
+@Field static final String SITE_TYPE = "Res_Solar_Site"
 @Field static final String METADATA_ATTRIBUTES = "DeviceState,modelName,name,sn,manufacturerName,macCode"
 
 @Field static final List POINTS = [
@@ -131,7 +131,7 @@ def mainPage() {
         }
 
         section("Logging") {
-            input "logEnable", "bool", title: "Enable debug logging (turns off after 30 minutes)", defaultValue: false
+            input "logEnable", "bool", title: "Enable debug logging (turns off after 30 minutes)", defaultValue: false, submitOnChange: true
             input "appLabel", "text", title: "Name this app", required: false, submitOnChange: true
             if (settings.appLabel) app.updateLabel(settings.appLabel)
         }
@@ -386,9 +386,10 @@ private boolean reauthenticate() {
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Find the water heaters on the account. The portal's site/asset list payloads aren't documented,
- * so this collects candidate site IDs from a couple of endpoints and asks the asset hierarchy
- * service for water heaters under each one. Manual IDs in "Advanced" are the fallback.
+ * Find the water heaters on the account, the same way the portal does: list the user's sites
+ * (mdmType Res_Solar_Site), then list the water heaters under each site. The asset hierarchy
+ * service is a fallback, and manual IDs under "Advanced" are the last resort.
+ * Summaries are logged at info level (counts and codes only); full responses only with debug on.
  */
 private void discover() {
     Set<String> sites = [] as Set
@@ -397,33 +398,35 @@ private void discover() {
 
     if (settings.manualParentId) sites << settings.manualParentId.trim()
 
-    [
-        [method: "POST", path: PATH_SITE_LIST, opts: [json: [pageNo: 1, pageSize: 100]]],
-        [method: "GET", path: PATH_SITE_LIST, opts: [query: [pageNo: 1, pageSize: 100]]],
-        [method: "POST", path: PATH_ASSET_LIST, opts: [json: [pageNo: 1, pageSize: 100, mdmType: WATER_HEATER_TYPE]]],
-    ].each { Map attempt ->
-        try {
-            Map resp = authedSyncRequest(attempt.method, attempt.path, attempt.opts)
-            logDebug "discovery ${attempt.method} ${attempt.path}: ${truncate(JsonOutput.toJson(resp))}"
-            if (isSuccess(resp)) scanForAssets(resp.data, null, sites, found, parents)
-        } catch (e) {
-            logDebug "discovery ${attempt.method} ${attempt.path} failed: ${e.message}"
-        }
-    }
+    Map siteResp = discoveryRequest("site list", "POST", PATH_ASSET_LIST,
+        [json: [view: "WebSiteViewListCard", mdmTypes: SITE_TYPE, pageNo: 1, pageSize: 100]])
+    if (isSuccess(siteResp)) scanForAssets(siteResp.data, null, sites, found, parents)
+    log.info "${app.label}: discovery found ${sites.size()} site(s)"
 
-    sites.each { String site ->
-        try {
-            Map resp = authedSyncRequest("POST", PATH_HIERARCHY, [form: [mdmIds: site, mdmTypes: WATER_HEATER_TYPE, attributes: "name,mdmType", locale: "en-US"]])
-            logDebug "hierarchy for ${site}: ${truncate(JsonOutput.toJson(resp))}"
-            List heaters = (resp?.data?.get(site)?.mdmObjects?.get(WATER_HEATER_TYPE) ?: []) as List
-            heaters.each { Map h ->
-                if (!h.mdmId) return
+    // Copy, because scanning a site's devices can add more site IDs
+    sites.toList().each { String site ->
+        Map resp = discoveryRequest("devices for site", "POST", PATH_ASSET_LIST,
+            [json: [mdmIds: site, mdmTypes: WATER_HEATER_TYPE, view: "DeviceMgtList", pageNo: 1, pageSize: 500]])
+        int before = found.size()
+        if (isSuccess(resp)) scanForAssets(resp.data, site, sites, found, parents)
+
+        if (found.size() == before) {
+            resp = discoveryRequest("hierarchy for site", "POST", PATH_HIERARCHY,
+                [form: [mdmIds: site, mdmTypes: WATER_HEATER_TYPE, attributes: "name,mdmType", locale: "en-US"]])
+            List heaters = (resp?.data instanceof Map ? resp.data[site]?.mdmObjects?.get(WATER_HEATER_TYPE) : null) ?: []
+            heaters.each { h ->
+                if (!(h instanceof Map) || !h.mdmId) return
                 found[h.mdmId as String] = (h.attributes?.name ?: h.mdmId) as String
                 parents[h.mdmId as String] = site
             }
-        } catch (e) {
-            logDebug "hierarchy lookup for ${site} failed: ${e.message}"
         }
+    }
+
+    if (!found) {
+        // Last try: some accounts may allow listing water heaters without a site
+        Map resp = discoveryRequest("water heaters", "POST", PATH_ASSET_LIST,
+            [json: [mdmTypes: WATER_HEATER_TYPE, view: "DeviceMgtList", pageNo: 1, pageSize: 500]])
+        if (isSuccess(resp)) scanForAssets(resp.data, null, sites, found, parents)
     }
 
     state.discovered = found
@@ -432,26 +435,43 @@ private void discover() {
         state.remove("lastError")
         log.info "${app.label}: found ${found.size()} heat pump(s)"
     } else {
-        state.lastError = "no heat pumps found automatically. Turn on debug logging and try again, or enter the IDs under Advanced"
+        state.lastError = "no heat pumps found automatically. Check the 'discovery' lines in the logs, or enter the IDs under Advanced"
         log.warn "${app.label}: ${state.lastError}"
+    }
+}
+
+private Map discoveryRequest(String what, String method, String path, Map opts) {
+    try {
+        Map resp = authedSyncRequest(method, path, opts)
+        def data = resp?.data
+        String size = data instanceof List ? "${data.size()} item(s)" : (data instanceof Map ? "${data.size()} key(s)" : "no data")
+        log.info "${app.label}: discovery ${what}: code ${resp?.code}${resp?.msg ? ' (' + resp.msg + ')' : ''}, ${size}"
+        logDebug "discovery ${what} response: ${truncate(JsonOutput.toJson(resp))}"
+        return resp
+    } catch (e) {
+        log.warn "${app.label}: discovery ${what} failed: ${e.message}"
+        return null
     }
 }
 
 /** Walk a JSON tree looking for water heaters and anything that looks like a site ID. */
 private void scanForAssets(def node, String parent, Set<String> sites, Map found, Map parents) {
     if (node instanceof Map) {
-        String type = (node.mdmType ?: node.assetType ?: node.type) as String
-        String id = (node.mdmId ?: node.assetId) as String
+        Map attrs = node.attributes instanceof Map ? node.attributes as Map : [:]
+        String type = (node.mdmType ?: attrs.mdmType ?: node.assetType ?: node.type) as String
+        String id = (node.mdmId ?: attrs.mdmId ?: node.assetId) as String
         String parentId = (node.parentId ?: node.siteId ?: parent) as String
         if (type == WATER_HEATER_TYPE && id) {
-            found[id] = (node.name ?: node.attributes?.name ?: node.assetName ?: id) as String
+            String name = (attrs.name ?: node.name ?: node.assetName ?: id) as String
+            String sn = (attrs.sn ?: node.sn) as String
+            found[id] = sn && sn != name ? "${name} (${sn})" : name
             if (parentId) {
                 parents[id] = parentId
                 sites << parentId
             }
         } else if (node.siteId) {
             sites << (node.siteId as String)
-        } else if (type?.toLowerCase()?.contains("site") && id) {
+        } else if ((type == SITE_TYPE || type?.toLowerCase()?.contains("site")) && id) {
             sites << id
         }
         node.each { k, v -> if (v instanceof Map || v instanceof List) scanForAssets(v, parentId, sites, found, parents) }
